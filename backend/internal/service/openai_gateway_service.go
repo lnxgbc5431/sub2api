@@ -1966,6 +1966,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	originalBody := body
 	reqModel, reqStream, promptCacheKey := extractOpenAIRequestMetaFromBody(body)
 	originalModel := reqModel
+	if customBaseURL := resolveCustomBaseURLForResponsesRouting(account); customBaseURL != "" {
+		return s.forwardCustomBaseResponsesAsChatCompletions(ctx, c, account, body, customBaseURL, startTime)
+	}
 
 	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
@@ -2668,6 +2671,365 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			FirstTokenMs:    firstTokenMs,
 		}, nil
 	}
+}
+
+func (s *OpenAIGatewayService) forwardCustomBaseResponsesAsChatCompletions(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	customBaseURL string,
+	startTime time.Time,
+) (*OpenAIForwardResult, error) {
+	var responsesReq apicompat.ResponsesRequest
+	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		writeResponsesError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse responses request body")
+		return nil, fmt.Errorf("parse responses request body: %w", err)
+	}
+	if responsesReq.Stream {
+		writeResponsesError(c, http.StatusBadRequest, "invalid_request_error", "custom base URL does not support streaming /responses yet; use /chat/completions")
+		return nil, errors.New("custom base URL does not support streaming responses")
+	}
+	chatReq, err := convertResponsesRequestToChatCompletions(&responsesReq)
+	if err != nil {
+		writeResponsesError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return nil, err
+	}
+	chatBody, err := json.Marshal(chatReq)
+	if err != nil {
+		writeResponsesError(c, http.StatusInternalServerError, "server_error", "Failed to prepare chat completions request")
+		return nil, fmt.Errorf("marshal chat completions request: %w", err)
+	}
+
+	normalizedBaseURL, err := s.validateUpstreamBaseURL(customBaseURL)
+	if err != nil {
+		writeResponsesError(c, http.StatusBadRequest, "invalid_request_error", "Invalid custom base URL")
+		return nil, fmt.Errorf("invalid custom base url: %w", err)
+	}
+	targetURL := JoinCustomBaseURL(normalizedBaseURL, "chat/completions")
+	token, _, err := s.GetAccessToken(ctx, account)
+	if err != nil {
+		writeResponsesError(c, http.StatusUnauthorized, "authentication_error", "Failed to get access token")
+		return nil, fmt.Errorf("get access token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(chatBody))
+	if err != nil {
+		return nil, fmt.Errorf("build custom chat completions request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	proxyURL := ""
+	if account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		safeErr := sanitizeUpstreamErrorMessage(err.Error())
+		setOpsUpstreamError(c, 0, safeErr, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: 0,
+			Kind:               "request_error",
+			Message:            safeErr,
+		})
+		writeResponsesError(c, http.StatusBadGateway, "server_error", "Upstream request failed")
+		return nil, fmt.Errorf("custom chat completions request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		writeResponsesError(c, http.StatusBadGateway, "server_error", "Failed to read upstream response")
+		return nil, fmt.Errorf("read custom chat completions response: %w", readErr)
+	}
+	if resp.StatusCode >= 400 {
+		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		if s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody) {
+			return nil, &UpstreamFailoverError{
+				StatusCode:             resp.StatusCode,
+				ResponseBody:           respBody,
+				ResponseHeaders:        resp.Header.Clone(),
+				RetryableOnSameAccount: account.IsPoolMode() && (isPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
+			}
+		}
+		writeResponsesError(c, mapUpstreamStatusCode(resp.StatusCode), "server_error", upstreamMsg)
+		return nil, fmt.Errorf("upstream error: %d %s", resp.StatusCode, upstreamMsg)
+	}
+
+	var chatResp apicompat.ChatCompletionsResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		writeResponsesError(c, http.StatusBadGateway, "server_error", "Invalid chat completions response from custom upstream")
+		return nil, fmt.Errorf("parse chat completions response: %w", err)
+	}
+	responsesResp := convertChatCompletionsResponseToResponses(&chatResp, responsesReq.Model)
+	outBody, err := json.Marshal(responsesResp)
+	if err != nil {
+		writeResponsesError(c, http.StatusBadGateway, "server_error", "Failed to encode responses response")
+		return nil, fmt.Errorf("marshal responses response: %w", err)
+	}
+
+	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	c.Data(http.StatusOK, "application/json", outBody)
+
+	result := &OpenAIForwardResult{
+		RequestID:       resp.Header.Get("x-request-id"),
+		Usage:           OpenAIUsage{},
+		Model:           strings.TrimSpace(responsesReq.Model),
+		UpstreamModel:   strings.TrimSpace(chatResp.Model),
+		ServiceTier:     extractOpenAIServiceTierFromBody(body),
+		ReasoningEffort: extractOpenAIReasoningEffortFromBody(body, responsesReq.Model),
+		Stream:          false,
+		OpenAIWSMode:    false,
+		Duration:        time.Since(startTime),
+		FirstTokenMs:    nil,
+	}
+	if responsesResp.Usage != nil {
+		result.Usage = OpenAIUsage{
+			InputTokens:  responsesResp.Usage.InputTokens,
+			OutputTokens: responsesResp.Usage.OutputTokens,
+		}
+		if responsesResp.Usage.InputTokensDetails != nil {
+			result.Usage.CacheReadInputTokens = responsesResp.Usage.InputTokensDetails.CachedTokens
+		}
+	}
+	return result, nil
+}
+
+func convertResponsesRequestToChatCompletions(req *apicompat.ResponsesRequest) (*apicompat.ChatCompletionsRequest, error) {
+	if req == nil {
+		return nil, errors.New("responses request is nil")
+	}
+	chatReq := &apicompat.ChatCompletionsRequest{
+		Model:        strings.TrimSpace(req.Model),
+		Instructions: req.Instructions,
+		Temperature:  req.Temperature,
+		TopP:         req.TopP,
+		Stream:       false,
+		ToolChoice:   req.ToolChoice,
+		ServiceTier:  req.ServiceTier,
+	}
+	if req.MaxOutputTokens != nil {
+		chatReq.MaxCompletionTokens = req.MaxOutputTokens
+	}
+	if req.Reasoning != nil {
+		chatReq.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
+	}
+	for i := range req.Tools {
+		tool := req.Tools[i]
+		if strings.TrimSpace(tool.Type) != "function" || strings.TrimSpace(tool.Name) == "" {
+			continue
+		}
+		chatReq.Tools = append(chatReq.Tools, apicompat.ChatTool{
+			Type: "function",
+			Function: &apicompat.ChatFunction{
+				Name:        strings.TrimSpace(tool.Name),
+				Description: tool.Description,
+				Parameters:  tool.Parameters,
+				Strict:      tool.Strict,
+			},
+		})
+	}
+	messages, err := convertResponsesInputToChatMessages(req.Input)
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, errors.New("responses input cannot be converted to chat messages")
+	}
+	chatReq.Messages = messages
+	return chatReq, nil
+}
+
+func resolveCustomBaseURLForResponsesRouting(account *Account) string {
+	if account == nil {
+		return ""
+	}
+	if custom := strings.TrimSpace(firstNonEmptyMapString(account.Extra, "custom_base_url", "customBaseURL", "custom_baseURL")); custom != "" {
+		return custom
+	}
+	enabled := false
+	if account.Extra != nil {
+		if v, ok := account.Extra["custom_base_url_enabled"].(bool); ok && v {
+			enabled = true
+		}
+	}
+	if !enabled {
+		return ""
+	}
+	return strings.TrimSpace(firstNonEmptyMapString(account.Credentials, "base_url", "baseURL", "BaseURL"))
+}
+
+func convertResponsesInputToChatMessages(input json.RawMessage) ([]apicompat.ChatMessage, error) {
+	trimmed := strings.TrimSpace(string(input))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var inputText string
+	if err := json.Unmarshal(input, &inputText); err == nil {
+		text := strings.TrimSpace(inputText)
+		if text == "" {
+			return nil, nil
+		}
+		content, _ := json.Marshal(text)
+		return []apicompat.ChatMessage{{Role: "user", Content: content}}, nil
+	}
+	var items []apicompat.ResponsesInputItem
+	if err := json.Unmarshal(input, &items); err != nil {
+		return nil, fmt.Errorf("parse responses input: %w", err)
+	}
+	messages := make([]apicompat.ChatMessage, 0, len(items))
+	for i := range items {
+		item := items[i]
+		switch strings.TrimSpace(item.Type) {
+		case "function_call_output":
+			content, _ := json.Marshal(item.Output)
+			messages = append(messages, apicompat.ChatMessage{
+				Role:       "tool",
+				Content:    content,
+				ToolCallID: strings.TrimSpace(item.CallID),
+			})
+			continue
+		case "function_call":
+			callID := strings.TrimSpace(item.CallID)
+			if callID == "" {
+				callID = strings.TrimSpace(item.ID)
+			}
+			toolCall := apicompat.ChatToolCall{
+				ID:   callID,
+				Type: "function",
+				Function: apicompat.ChatFunctionCall{
+					Name:      strings.TrimSpace(item.Name),
+					Arguments: item.Arguments,
+				},
+			}
+			content, _ := json.Marshal("")
+			messages = append(messages, apicompat.ChatMessage{
+				Role:      "assistant",
+				Content:   content,
+				ToolCalls: []apicompat.ChatToolCall{toolCall},
+			})
+			continue
+		}
+
+		role := strings.TrimSpace(item.Role)
+		if role == "" {
+			role = "user"
+		}
+		if len(item.Content) == 0 {
+			continue
+		}
+		msg := apicompat.ChatMessage{Role: role}
+		var contentText string
+		if err := json.Unmarshal(item.Content, &contentText); err == nil {
+			raw, _ := json.Marshal(contentText)
+			msg.Content = raw
+			messages = append(messages, msg)
+			continue
+		}
+		var parts []apicompat.ResponsesContentPart
+		if err := json.Unmarshal(item.Content, &parts); err != nil {
+			continue
+		}
+		chatParts := make([]apicompat.ChatContentPart, 0, len(parts))
+		for _, part := range parts {
+			switch strings.TrimSpace(part.Type) {
+			case "input_text", "output_text", "text":
+				if strings.TrimSpace(part.Text) == "" {
+					continue
+				}
+				chatParts = append(chatParts, apicompat.ChatContentPart{
+					Type: "text",
+					Text: part.Text,
+				})
+			case "input_image":
+				if strings.TrimSpace(part.ImageURL) == "" {
+					continue
+				}
+				chatParts = append(chatParts, apicompat.ChatContentPart{
+					Type: "image_url",
+					ImageURL: &apicompat.ChatImageURL{
+						URL: part.ImageURL,
+					},
+				})
+			}
+		}
+		if len(chatParts) == 0 {
+			continue
+		}
+		raw, _ := json.Marshal(chatParts)
+		msg.Content = raw
+		messages = append(messages, msg)
+	}
+	return messages, nil
+}
+
+func convertChatCompletionsResponseToResponses(resp *apicompat.ChatCompletionsResponse, requestModel string) *apicompat.ResponsesResponse {
+	out := &apicompat.ResponsesResponse{
+		ID:     strings.TrimSpace(resp.ID),
+		Object: "response",
+		Model:  strings.TrimSpace(resp.Model),
+		Status: "completed",
+		Output: make([]apicompat.ResponsesOutput, 0, 2),
+	}
+	if out.ID == "" {
+		out.ID = "resp_custom_base"
+	}
+	if out.Model == "" {
+		out.Model = strings.TrimSpace(requestModel)
+	}
+	if resp.Usage != nil {
+		out.Usage = &apicompat.ResponsesUsage{
+			InputTokens:  resp.Usage.PromptTokens,
+			OutputTokens: resp.Usage.CompletionTokens,
+			TotalTokens:  resp.Usage.TotalTokens,
+		}
+	}
+	if len(resp.Choices) == 0 {
+		out.Status = "failed"
+		out.Error = &apicompat.ResponsesError{Code: "invalid_response", Message: "chat completions response has no choices"}
+		return out
+	}
+	choice := resp.Choices[0]
+	contentParts := make([]apicompat.ResponsesContentPart, 0, 2)
+	var contentText string
+	if err := json.Unmarshal(choice.Message.Content, &contentText); err == nil {
+		if strings.TrimSpace(contentText) != "" {
+			contentParts = append(contentParts, apicompat.ResponsesContentPart{Type: "output_text", Text: contentText})
+		}
+	} else {
+		var chatParts []apicompat.ChatContentPart
+		if err := json.Unmarshal(choice.Message.Content, &chatParts); err == nil {
+			for _, part := range chatParts {
+				if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
+					contentParts = append(contentParts, apicompat.ResponsesContentPart{Type: "output_text", Text: part.Text})
+				}
+			}
+		}
+	}
+	out.Output = append(out.Output, apicompat.ResponsesOutput{
+		Type:    "message",
+		ID:      choice.Message.ToolCallID,
+		Role:    "assistant",
+		Content: contentParts,
+		Status:  "completed",
+	})
+	for _, tc := range choice.Message.ToolCalls {
+		out.Output = append(out.Output, apicompat.ResponsesOutput{
+			Type:      "function_call",
+			CallID:    tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	if choice.FinishReason == "length" {
+		out.Status = "incomplete"
+		out.IncompleteDetails = &apicompat.ResponsesIncompleteDetails{Reason: "max_output_tokens"}
+	}
+	return out
 }
 
 func (s *OpenAIGatewayService) forwardOpenAIPassthrough(

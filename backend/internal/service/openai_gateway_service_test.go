@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/cespare/xxhash/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -104,6 +106,27 @@ type failingGinWriter struct {
 	gin.ResponseWriter
 	failAfter int
 	writes    int
+}
+
+type openAIForwardUpstreamRecorder struct {
+	lastReq  *http.Request
+	lastBody []byte
+	resp     *http.Response
+	err      error
+}
+
+func (m *openAIForwardUpstreamRecorder) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	m.lastReq = req
+	body, _ := io.ReadAll(req.Body)
+	m.lastBody = body
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.resp, nil
+}
+
+func (m *openAIForwardUpstreamRecorder) DoWithTLS(req *http.Request, _ string, _ int64, _ int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return m.Do(req, "", 0, 0)
 }
 
 func (w *failingGinWriter) Write(p []byte) (int, error) {
@@ -1829,6 +1852,164 @@ func TestOpenAIBuildUpstreamRequestOAuthOfficialClientOriginatorCompatibility(t 
 			require.Equal(t, tt.wantOriginator, req.Header.Get("originator"))
 		})
 	}
+}
+
+func TestOpenAIForward_CustomBaseURLResponsesCompactUsesChatCompletionsPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/responses/compact", bytes.NewReader([]byte(`{"model":"gpt-5","input":"hi","stream":false}`)))
+
+	upstream := &openAIForwardUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`,
+			)),
+		},
+	}
+	svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+	account := &Account{
+		ID:          1,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Extra:       map[string]any{"custom_base_url_enabled": true},
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.example.com/v1",
+		},
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5","input":"hi","stream":false}`))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "/v1/chat/completions", upstream.lastReq.URL.Path)
+	require.NotContains(t, upstream.lastReq.URL.Path, "/responses/compact")
+	require.NotContains(t, upstream.lastReq.URL.Path, "/v1/v1/chat/completions")
+	require.NotContains(t, upstream.lastReq.URL.Path, "//chat/completions")
+
+	var forwarded map[string]any
+	require.NoError(t, json.Unmarshal(upstream.lastBody, &forwarded))
+	require.Equal(t, "gpt-5", forwarded["model"])
+	_, hasMessages := forwarded["messages"]
+	require.True(t, hasMessages)
+	_, hasInput := forwarded["input"]
+	require.False(t, hasInput)
+}
+
+func TestOpenAIForward_CustomBaseURLV1ResponsesCompactUsesChatCompletionsPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader([]byte(`{"model":"gpt-5","input":"hi","stream":false}`)))
+
+	upstream := &openAIForwardUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"chatcmpl_2","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+			)),
+		},
+	}
+	svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+	account := &Account{
+		ID:          2,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Extra:       map[string]any{"custom_base_url_enabled": true},
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.example.com/v1/",
+		},
+	}
+
+	_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5","input":"hi","stream":false}`))
+	require.NoError(t, err)
+	require.Equal(t, "/v1/chat/completions", upstream.lastReq.URL.Path)
+	require.NotContains(t, upstream.lastReq.URL.Path, "/responses/compact")
+}
+
+func TestOpenAIForward_CustomBaseURLResponsesRootUsesChatCompletionsPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		baseURL string
+		want    string
+	}{
+		{name: "responses alias + root base", path: "/responses", baseURL: "https://api.example.com", want: "/chat/completions"},
+		{name: "v1 responses + slash root base", path: "/v1/responses", baseURL: "https://api.example.com/", want: "/chat/completions"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, tt.path, bytes.NewReader([]byte(`{"model":"gpt-5","input":"hi","stream":false}`)))
+
+			upstream := &openAIForwardUpstreamRecorder{
+				resp: &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(
+						`{"id":"chatcmpl_3","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+					)),
+				},
+			}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+			account := &Account{
+				ID:          3,
+				Platform:    PlatformOpenAI,
+				Type:        AccountTypeAPIKey,
+				Concurrency: 1,
+				Extra:       map[string]any{"custom_base_url_enabled": true},
+				Credentials: map[string]any{
+					"api_key":  "sk-test",
+					"base_url": tt.baseURL,
+				},
+			}
+
+			_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5","input":"hi","stream":false}`))
+			require.NoError(t, err)
+			require.Equal(t, tt.want, upstream.lastReq.URL.Path)
+			require.NotContains(t, upstream.lastReq.URL.Path, "/responses")
+		})
+	}
+}
+
+func TestOpenAIForward_EmptyCustomBaseURLKeepsOfficialResponsesCompactPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/responses/compact", bytes.NewReader([]byte(`{"model":"gpt-5","input":"hi","stream":false}`)))
+
+	upstream := &openAIForwardUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[]}`,
+			)),
+		},
+	}
+	svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+	account := &Account{
+		ID:          4,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "sk-test",
+		},
+	}
+
+	_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5","input":"hi","stream":false}`))
+	require.NoError(t, err)
+	require.Equal(t, "/v1/responses/compact", upstream.lastReq.URL.Path)
 }
 
 // ==================== P1-08 修复：model 替换性能优化测试 ====================
