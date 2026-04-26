@@ -3,6 +3,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -157,4 +158,113 @@ func TestGetGeminiBaseURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEffectiveCustomBaseURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		account  Account
+		expected string
+	}{
+		{
+			name: "reads from credentials.base_url",
+			account: Account{
+				Credentials: map[string]any{"base_url": "https://api.example.com/v1"},
+			},
+			expected: "https://api.example.com/v1",
+		},
+		{
+			name: "reads from extra.custom_base_url with higher priority",
+			account: Account{
+				Extra:       map[string]any{"custom_base_url": " https://proxy.example.com/v1 "},
+				Credentials: map[string]any{"base_url": "https://api.example.com/v1"},
+			},
+			expected: "https://proxy.example.com/v1",
+		},
+		{
+			name: "reads from alias keys",
+			account: Account{
+				Extra: map[string]any{"customBaseURL": "https://alias.example.com/v1"},
+			},
+			expected: "https://alias.example.com/v1",
+		},
+		{
+			name: "empty returns empty",
+			account: Account{
+				Credentials: map[string]any{"base_url": "   "},
+				Extra:       map[string]any{"custom_base_url": ""},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.account.GetEffectiveCustomBaseURL()
+			if got != tt.expected {
+				t.Fatalf("GetEffectiveCustomBaseURL() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestJoinCustomBaseURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseURL  string
+		endpoint string
+		want     string
+	}{
+		{
+			name:     "domain without trailing slash",
+			baseURL:  "https://api.example.com",
+			endpoint: "chat/completions",
+			want:     "https://api.example.com/chat/completions",
+		},
+		{
+			name:     "domain with trailing slash",
+			baseURL:  "https://api.example.com/",
+			endpoint: "chat/completions",
+			want:     "https://api.example.com/chat/completions",
+		},
+		{
+			name:     "v1 without trailing slash",
+			baseURL:  "https://api.example.com/v1",
+			endpoint: "chat/completions",
+			want:     "https://api.example.com/v1/chat/completions",
+		},
+		{
+			name:     "v1 with trailing slash",
+			baseURL:  "https://api.example.com/v1/",
+			endpoint: "chat/completions",
+			want:     "https://api.example.com/v1/chat/completions",
+		},
+		{
+			name:     "endpoint with leading slash",
+			baseURL:  "https://api.example.com/v1/",
+			endpoint: "/chat/completions",
+			want:     "https://api.example.com/v1/chat/completions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := JoinCustomBaseURL(tt.baseURL, tt.endpoint)
+			if got != tt.want {
+				t.Fatalf("JoinCustomBaseURL() = %q, want %q", got, tt.want)
+			}
+			if containsAny(got, "/v1/v1/", "//chat/completions", "/chat/completions/chat/completions") {
+				t.Fatalf("JoinCustomBaseURL() produced invalid path: %q", got)
+			}
+		})
+	}
+}
+
+func containsAny(s string, patterns ...string) bool {
+	for _, p := range patterns {
+		if p != "" && strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
 }

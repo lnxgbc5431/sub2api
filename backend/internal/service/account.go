@@ -1489,6 +1489,55 @@ func (a *Account) GetCustomBaseURL() string {
 	return a.GetExtraString("custom_base_url")
 }
 
+// GetEffectiveCustomBaseURL returns the custom base URL override for OpenAI-compatible routing.
+// Priority:
+// 1. extra.custom_base_url (+ common alias keys)
+// 2. credentials.base_url (+ common alias keys)
+func (a *Account) GetEffectiveCustomBaseURL() string {
+	if a == nil {
+		return ""
+	}
+	if baseURL := firstNonEmptyMapString(a.Extra, "custom_base_url", "customBaseURL", "custom_baseURL"); baseURL != "" {
+		return strings.TrimSpace(baseURL)
+	}
+	if baseURL := firstNonEmptyMapString(a.Credentials, "base_url", "baseURL", "BaseURL", "custom_base_url", "customBaseURL", "custom_baseURL"); baseURL != "" {
+		return strings.TrimSpace(baseURL)
+	}
+	return ""
+}
+
+// JoinCustomBaseURL builds a stable upstream URL without duplicate slashes.
+// Example: JoinCustomBaseURL("https://example.com/v1/", "chat/completions")
+// => https://example.com/v1/chat/completions
+func JoinCustomBaseURL(baseURL, endpoint string) string {
+	trimmedBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	trimmedEndpoint := strings.TrimLeft(strings.TrimSpace(endpoint), "/")
+	switch {
+	case trimmedBase == "":
+		return "/" + trimmedEndpoint
+	case trimmedEndpoint == "":
+		return trimmedBase
+	default:
+		return trimmedBase + "/" + trimmedEndpoint
+	}
+}
+
+func firstNonEmptyMapString(src map[string]any, keys ...string) string {
+	if len(src) == 0 {
+		return ""
+	}
+	for _, key := range keys {
+		val, ok := src[key]
+		if !ok || val == nil {
+			continue
+		}
+		if strVal, ok := val.(string); ok && strings.TrimSpace(strVal) != "" {
+			return strVal
+		}
+	}
+	return ""
+}
+
 // IsCacheTTLOverrideEnabled 检查是否启用缓存 TTL 强制替换
 // 仅适用于 Anthropic OAuth/SetupToken 类型账号
 // 启用后将所有 cache creation tokens 归入指定的 TTL 类型（5m 或 1h）
