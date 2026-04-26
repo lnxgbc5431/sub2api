@@ -136,3 +136,5 @@ docs/*
 frontend/coverage/
 aicodex
 output/
+AGENTS.md
+backend/reset_sub2api.sh
