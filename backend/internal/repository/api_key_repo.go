@@ -8,6 +8,8 @@ import (
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/ent/account"
+	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
 	"github.com/Wei-Shaw/sub2api/ent/apikey"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/schema/mixins"
@@ -341,6 +343,9 @@ func (r *apiKeyRepository) ListByUserID(ctx context.Context, userID int64, param
 	outKeys := make([]service.APIKey, 0, len(keys))
 	for i := range keys {
 		outKeys = append(outKeys, *apiKeyEntityToService(keys[i]))
+	}
+	if err := r.hydrateGroupCustomBaseURLFlags(ctx, outKeys); err != nil {
+		return nil, nil, err
 	}
 
 	return outKeys, paginationResultFromTotal(int64(total), params), nil
@@ -714,12 +719,89 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		AllowMessagesDispatch:           g.AllowMessagesDispatch,
 		RequireOAuthOnly:                g.RequireOauthOnly,
 		RequirePrivacySet:               g.RequirePrivacySet,
+		HasCustomBaseURL:                false,
 		DefaultMappedModel:              g.DefaultMappedModel,
 		MessagesDispatchModelConfig:     g.MessagesDispatchModelConfig,
 		RPMLimit:                        g.RpmLimit,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}
+}
+
+func (r *apiKeyRepository) hydrateGroupCustomBaseURLFlags(ctx context.Context, keys []service.APIKey) error {
+	groupIDs := make([]int64, 0, len(keys))
+	groupRefs := make(map[int64][]*service.Group, len(keys))
+	for i := range keys {
+		g := keys[i].Group
+		if g == nil || g.ID <= 0 {
+			continue
+		}
+		if _, ok := groupRefs[g.ID]; !ok {
+			groupIDs = append(groupIDs, g.ID)
+		}
+		groupRefs[g.ID] = append(groupRefs[g.ID], g)
+	}
+	if len(groupIDs) == 0 {
+		return nil
+	}
+
+	accountGroups, err := r.client.AccountGroup.Query().
+		Where(accountgroup.GroupIDIn(groupIDs...)).
+		WithAccount(func(q *dbent.AccountQuery) {
+			q.Where(
+				account.DeletedAtIsNil(),
+				account.StatusEQ(service.StatusActive),
+			)
+			q.Select(account.FieldCredentials, account.FieldExtra)
+		}).
+		All(ctx)
+	if err != nil {
+		return err
+	}
+
+	hasCustomByGroupID := make(map[int64]bool, len(groupIDs))
+	for _, ag := range accountGroups {
+		if ag == nil || ag.Edges.Account == nil {
+			continue
+		}
+		if hasEffectiveCustomBaseURL(ag.Edges.Account.Credentials, ag.Edges.Account.Extra) {
+			hasCustomByGroupID[ag.GroupID] = true
+		}
+	}
+
+	for groupID, refs := range groupRefs {
+		flag := hasCustomByGroupID[groupID]
+		for _, g := range refs {
+			g.HasCustomBaseURL = flag
+		}
+	}
+	return nil
+}
+
+func hasEffectiveCustomBaseURL(credentials map[string]any, extra map[string]any) bool {
+	return firstNonEmptyMapString(extra, "custom_base_url", "customBaseURL", "custom_baseURL") != "" ||
+		firstNonEmptyMapString(credentials, "base_url", "baseURL", "BaseURL", "custom_base_url", "customBaseURL", "custom_baseURL") != ""
+}
+
+func firstNonEmptyMapString(src map[string]any, keys ...string) string {
+	if len(src) == 0 {
+		return ""
+	}
+	for _, key := range keys {
+		val, ok := src[key]
+		if !ok || val == nil {
+			continue
+		}
+		strVal, ok := val.(string)
+		if !ok {
+			continue
+		}
+		trimmed := strings.TrimSpace(strVal)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func derefString(s *string) string {

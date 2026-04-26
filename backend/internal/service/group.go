@@ -56,6 +56,7 @@ type Group struct {
 	AllowMessagesDispatch       bool
 	RequireOAuthOnly            bool // 仅允许非 apikey 类型账号关联（OpenAI/Antigravity/Anthropic/Gemini）
 	RequirePrivacySet           bool // 调度时仅允许 privacy 已成功设置的账号（OpenAI/Antigravity/Anthropic/Gemini）
+	HasCustomBaseURL            bool // 用户侧展示用：该分组是否存在可用 custom base URL 账号
 	DefaultMappedModel          string
 	MessagesDispatchModelConfig OpenAIMessagesDispatchModelConfig
 
