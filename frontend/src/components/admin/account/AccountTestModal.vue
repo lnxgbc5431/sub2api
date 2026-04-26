@@ -182,6 +182,16 @@
           }}
         </span>
       </div>
+
+      <div class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:border-blue-800 dark:bg-blue-900/20 dark:text-blue-300">
+        <template v-if="account?.custom_base_url">
+          Custom Base URL detected. Test connection uses OpenAI-compatible endpoint:
+          <span class="font-mono">{{ account.custom_base_url }}/chat/completions</span>
+        </template>
+        <template v-else>
+          No custom Base URL set. Test connection uses the selected platform's official endpoint.
+        </template>
+      </div>
     </div>
 
     <template #footer>

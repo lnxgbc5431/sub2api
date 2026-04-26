@@ -50,4 +50,58 @@ describe('UseKeyModal', () => {
     expect(codeBlock.text()).toContain('"name": "GPT-5.4 Mini"')
     expect(codeBlock.text()).not.toContain('"name": "GPT-5.4 Nano"')
   })
+
+  it('normalizes /v1 suffix without duplication for OpenCode config', async () => {
+    const wrapper = mount(UseKeyModal, {
+      props: {
+        show: true,
+        apiKey: 'sk-test',
+        baseUrl: 'https://example.com/v1/',
+        platform: 'openai'
+      },
+      global: {
+        stubs: {
+          BaseDialog: { template: '<div><slot /><slot name="footer" /></div>' },
+          Icon: { template: '<span />' }
+        }
+      }
+    })
+
+    const opencodeTab = wrapper.findAll('button').find((button) =>
+      button.text().includes('keys.useKeyModal.cliTabs.opencode')
+    )
+    await opencodeTab!.trigger('click')
+    await nextTick()
+
+    const code = wrapper.find('pre code').text()
+    expect(code).toContain('"baseURL": "https://example.com/v1"')
+    expect(code).not.toContain('/v1/v1')
+  })
+
+  it('handles trailing slash base url for OpenCode config', async () => {
+    const wrapper = mount(UseKeyModal, {
+      props: {
+        show: true,
+        apiKey: 'sk-test',
+        baseUrl: 'https://example.com/',
+        platform: 'openai'
+      },
+      global: {
+        stubs: {
+          BaseDialog: { template: '<div><slot /><slot name="footer" /></div>' },
+          Icon: { template: '<span />' }
+        }
+      }
+    })
+
+    const opencodeTab = wrapper.findAll('button').find((button) =>
+      button.text().includes('keys.useKeyModal.cliTabs.opencode')
+    )
+    await opencodeTab!.trigger('click')
+    await nextTick()
+
+    const code = wrapper.find('pre code').text()
+    expect(code).toContain('"baseURL": "https://example.com/v1"')
+    expect(code).not.toContain('//v1')
+  })
 })

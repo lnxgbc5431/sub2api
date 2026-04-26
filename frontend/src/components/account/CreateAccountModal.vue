@@ -2273,6 +2273,10 @@
               class="input"
               :placeholder="t('admin.accounts.quotaControl.customBaseUrl.urlHint')"
             />
+            <p class="mt-2 text-xs text-blue-600 dark:text-blue-400">
+              Custom Base URL is always treated as OpenAI-compatible. Requests and test connection use:
+              <span class="font-mono">{custom_base_url}/chat/completions</span>.
+            </p>
           </div>
         </div>
       </div>

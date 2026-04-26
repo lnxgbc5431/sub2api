@@ -357,6 +357,19 @@ const platformNote = computed(() => {
 
 const showPlatformNote = computed(() => activeClientTab.value !== 'opencode')
 
+const normalizeBaseRoot = (value: string): string => {
+  const trimmed = (value || '').trim()
+  if (!trimmed) return ''
+  return trimmed.replace(/\/+$/, '')
+}
+
+const withVersionSuffix = (value: string, suffix: '/v1' | '/v1beta'): string => {
+  const root = normalizeBaseRoot(value)
+  if (!root) return suffix
+  if (root.endsWith(suffix)) return root
+  return `${root}${suffix}`
+}
+
 const escapeHtml = (value: string) => value
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
@@ -376,23 +389,13 @@ const comment = (value: string) => wrapToken('text-slate-500', value)
 // Syntax highlighting helpers
 // Generate file configs based on platform and active tab
 const currentFiles = computed((): FileConfig[] => {
-  const baseUrl = props.baseUrl || window.location.origin
+  const baseUrl = normalizeBaseRoot(props.baseUrl || window.location.origin)
   const apiKey = props.apiKey
-  const baseRoot = baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '')
-  const ensureV1 = (value: string) => {
-    const trimmed = value.replace(/\/+$/, '')
-    return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`
-  }
-  const apiBase = ensureV1(baseRoot)
-  const antigravityBase = ensureV1(`${baseRoot}/antigravity`)
-  const antigravityGeminiBase = (() => {
-    const trimmed = `${baseRoot}/antigravity`.replace(/\/+$/, '')
-    return trimmed.endsWith('/v1beta') ? trimmed : `${trimmed}/v1beta`
-  })()
-  const geminiBase = (() => {
-    const trimmed = baseRoot.replace(/\/+$/, '')
-    return trimmed.endsWith('/v1beta') ? trimmed : `${trimmed}/v1beta`
-  })()
+  const baseRoot = baseUrl.replace(/\/v1\/?$/, '')
+  const apiBase = withVersionSuffix(baseRoot, '/v1')
+  const antigravityBase = withVersionSuffix(`${baseRoot}/antigravity`, '/v1')
+  const antigravityGeminiBase = withVersionSuffix(`${baseRoot}/antigravity`, '/v1beta')
+  const geminiBase = withVersionSuffix(baseRoot, '/v1beta')
 
   if (activeClientTab.value === 'opencode') {
     switch (props.platform) {
