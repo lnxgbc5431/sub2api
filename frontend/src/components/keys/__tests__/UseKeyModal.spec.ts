@@ -57,7 +57,8 @@ describe('UseKeyModal', () => {
         show: true,
         apiKey: 'sk-test',
         baseUrl: 'https://example.com/v1/',
-        platform: 'openai'
+        platform: 'openai',
+        hasCustomBaseURL: true
       },
       global: {
         stubs: {
@@ -84,7 +85,8 @@ describe('UseKeyModal', () => {
         show: true,
         apiKey: 'sk-test',
         baseUrl: 'https://example.com/',
-        platform: 'openai'
+        platform: 'openai',
+        hasCustomBaseURL: true
       },
       global: {
         stubs: {
@@ -103,5 +105,49 @@ describe('UseKeyModal', () => {
     const code = wrapper.find('pre code').text()
     expect(code).toContain('"baseURL": "https://example.com/v1"')
     expect(code).not.toContain('//v1')
+  })
+
+  it('uses service root base url for official groups', async () => {
+    const wrapper = mount(UseKeyModal, {
+      props: {
+        show: true,
+        apiKey: 'sk-test',
+        baseUrl: 'https://example.com',
+        platform: 'openai',
+        hasCustomBaseURL: false
+      },
+      global: {
+        stubs: {
+          BaseDialog: { template: '<div><slot /><slot name="footer" /></div>' },
+          Icon: { template: '<span />' }
+        }
+      }
+    })
+
+    const code = wrapper.find('pre code').text()
+    expect(code).toContain('base_url = "https://example.com"')
+    expect(code).not.toContain('/v1/v1')
+  })
+
+  it('uses /v1 base url for custom groups without duplicating suffix', async () => {
+    const wrapper = mount(UseKeyModal, {
+      props: {
+        show: true,
+        apiKey: 'sk-test',
+        baseUrl: 'https://example.com/v1/',
+        platform: 'openai',
+        hasCustomBaseURL: true
+      },
+      global: {
+        stubs: {
+          BaseDialog: { template: '<div><slot /><slot name="footer" /></div>' },
+          Icon: { template: '<span />' }
+        }
+      }
+    })
+
+    const code = wrapper.find('pre code').text()
+    expect(code).toContain('base_url = "https://example.com/v1"')
+    expect(code).not.toContain('/v1/v1')
   })
 })

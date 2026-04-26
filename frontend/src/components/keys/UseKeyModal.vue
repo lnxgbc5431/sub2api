@@ -146,6 +146,7 @@ interface Props {
   apiKey: string
   baseUrl: string
   platform: GroupPlatform | null
+  hasCustomBaseURL?: boolean
   allowMessagesDispatch?: boolean
 }
 
@@ -389,9 +390,12 @@ const comment = (value: string) => wrapToken('text-slate-500', value)
 // Syntax highlighting helpers
 // Generate file configs based on platform and active tab
 const currentFiles = computed((): FileConfig[] => {
-  const baseUrl = normalizeBaseRoot(props.baseUrl || window.location.origin)
+  const serviceBaseUrl = normalizeBaseRoot(props.baseUrl || window.location.origin)
+  const openAIBaseUrl = props.hasCustomBaseURL
+    ? withVersionSuffix(serviceBaseUrl, '/v1')
+    : serviceBaseUrl
   const apiKey = props.apiKey
-  const baseRoot = baseUrl.replace(/\/v1\/?$/, '')
+  const baseRoot = serviceBaseUrl.replace(/\/v1\/?$/, '')
   const apiBase = withVersionSuffix(baseRoot, '/v1')
   const antigravityBase = withVersionSuffix(`${baseRoot}/antigravity`, '/v1')
   const antigravityGeminiBase = withVersionSuffix(`${baseRoot}/antigravity`, '/v1beta')
@@ -402,7 +406,7 @@ const currentFiles = computed((): FileConfig[] => {
       case 'anthropic':
         return [generateOpenCodeConfig('anthropic', apiBase, apiKey)]
       case 'openai':
-        return [generateOpenCodeConfig('openai', apiBase, apiKey)]
+        return [generateOpenCodeConfig('openai', openAIBaseUrl, apiKey)]
       case 'gemini':
         return [generateOpenCodeConfig('gemini', geminiBase, apiKey)]
       case 'antigravity':
@@ -418,21 +422,21 @@ const currentFiles = computed((): FileConfig[] => {
   switch (props.platform) {
     case 'openai':
       if (activeClientTab.value === 'claude') {
-        return generateAnthropicFiles(baseUrl, apiKey)
+        return generateAnthropicFiles(openAIBaseUrl, apiKey)
       }
       if (activeClientTab.value === 'codex-ws') {
-        return generateOpenAIWsFiles(baseUrl, apiKey)
+        return generateOpenAIWsFiles(openAIBaseUrl, apiKey)
       }
-      return generateOpenAIFiles(baseUrl, apiKey)
+      return generateOpenAIFiles(openAIBaseUrl, apiKey)
     case 'gemini':
-      return [generateGeminiCliContent(baseUrl, apiKey)]
+      return [generateGeminiCliContent(serviceBaseUrl, apiKey)]
     case 'antigravity':
       if (activeClientTab.value === 'gemini') {
-        return [generateGeminiCliContent(`${baseUrl}/antigravity`, apiKey)]
+        return [generateGeminiCliContent(`${serviceBaseUrl}/antigravity`, apiKey)]
       }
-      return generateAnthropicFiles(`${baseUrl}/antigravity`, apiKey)
+      return generateAnthropicFiles(`${serviceBaseUrl}/antigravity`, apiKey)
     default:
-      return generateAnthropicFiles(baseUrl, apiKey)
+      return generateAnthropicFiles(serviceBaseUrl, apiKey)
   }
 })
 
