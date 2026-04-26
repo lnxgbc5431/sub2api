@@ -111,7 +111,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuth404MarksUnsu
 	require.Contains(t, rec.Body.String(), `"type":"error"`)
 }
 
-func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesCompactPath(t *testing.T) {
+func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyWithCustomBaseURLUsesChatCompletions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
@@ -151,10 +151,13 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesCompact
 	err := svc.TestAccountConnection(c, account.ID, "gpt-5.4", "", AccountTestModeCompact)
 	require.NoError(t, err)
 
-	require.Equal(t, "https://example.com/v1/responses/compact", upstream.lastReq.URL.String())
-	require.Equal(t, "gpt-5.4-openai-compact", gjson.GetBytes(upstream.lastBody, "model").String())
-	updates := <-updateCalls
-	require.Equal(t, true, updates["openai_compact_supported"])
+	require.Equal(t, "https://example.com/v1/chat/completions", upstream.lastReq.URL.String())
+	require.Equal(t, "gpt-5.4", gjson.GetBytes(upstream.lastBody, "model").String())
+	select {
+	case updates := <-updateCalls:
+		t.Fatalf("unexpected compact capability update: %#v", updates)
+	default:
+	}
 }
 
 func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBaseURLUsesV1Path(t *testing.T) {
