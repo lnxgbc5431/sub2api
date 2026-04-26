@@ -33,6 +33,10 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	body []byte,
 	parsed *ParsedRequest,
 ) (*ForwardResult, error) {
+	if customBaseURL := account.GetEffectiveCustomBaseURL(); customBaseURL != "" {
+		return s.forwardCustomBaseChatCompletions(ctx, c, account, body, customBaseURL)
+	}
+
 	startTime := time.Now()
 
 	// 1. Parse Chat Completions request
@@ -187,6 +191,70 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	}
 
 	return result, handleErr
+}
+
+func (s *GatewayService) forwardCustomBaseChatCompletions(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	customBaseURL string,
+) (*ForwardResult, error) {
+	normalizedBaseURL, err := s.validateUpstreamBaseURL(customBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid custom base url: %w", err)
+	}
+	targetURL := JoinCustomBaseURL(normalizedBaseURL, "chat/completions")
+	token, _, err := s.GetAccessToken(ctx, account)
+	if err != nil {
+		return nil, fmt.Errorf("get access token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build custom chat completions request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	if err != nil {
+		return nil, fmt.Errorf("custom chat completions request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, fmt.Errorf("read custom chat completions response: %w", readErr)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, &UpstreamFailoverError{
+			StatusCode:      resp.StatusCode,
+			ResponseBody:    respBody,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+	}
+
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	writeAnthropicPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	c.Data(resp.StatusCode, contentType, respBody)
+
+	result := &ForwardResult{
+		RequestID:    resp.Header.Get("x-request-id"),
+		Model:        strings.TrimSpace(gjson.GetBytes(body, "model").String()),
+		UpstreamModel: strings.TrimSpace(gjson.GetBytes(body, "model").String()),
+		Stream:       gjson.GetBytes(body, "stream").Bool(),
+	}
+	return result, nil
 }
 
 // extractCCReasoningEffortFromBody reads reasoning effort from a Chat Completions

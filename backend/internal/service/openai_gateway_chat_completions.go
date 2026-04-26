@@ -50,6 +50,10 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	promptCacheKey string,
 	defaultMappedModel string,
 ) (*OpenAIForwardResult, error) {
+	if customBaseURL := account.GetEffectiveCustomBaseURL(); customBaseURL != "" {
+		return s.forwardCustomBaseChatCompletions(ctx, c, account, body, customBaseURL)
+	}
+
 	startTime := time.Now()
 
 	// 1. Parse Chat Completions request
@@ -277,6 +281,76 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	}
 
 	return result, handleErr
+}
+
+func (s *OpenAIGatewayService) forwardCustomBaseChatCompletions(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	customBaseURL string,
+) (*OpenAIForwardResult, error) {
+	normalizedBaseURL, err := s.validateUpstreamBaseURL(customBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid custom base url: %w", err)
+	}
+	targetURL := JoinCustomBaseURL(normalizedBaseURL, "chat/completions")
+
+	token, _, err := s.GetAccessToken(ctx, account)
+	if err != nil {
+		return nil, fmt.Errorf("get access token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build custom chat completions request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	proxyURL := ""
+	if account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return nil, fmt.Errorf("custom chat completions request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, fmt.Errorf("read custom chat completions response: %w", readErr)
+	}
+
+	if resp.StatusCode >= 400 {
+		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		if s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody) {
+			return nil, &UpstreamFailoverError{
+				StatusCode:             resp.StatusCode,
+				ResponseBody:           respBody,
+				ResponseHeaders:        resp.Header.Clone(),
+				RetryableOnSameAccount: account.IsPoolMode() && (isPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
+			}
+		}
+		writeChatCompletionsError(c, mapUpstreamStatusCode(resp.StatusCode), "server_error", upstreamMsg)
+		return nil, fmt.Errorf("upstream error: %d %s", resp.StatusCode, upstreamMsg)
+	}
+
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	c.Data(resp.StatusCode, contentType, respBody)
+
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	return &OpenAIForwardResult{
+		RequestID:     resp.Header.Get("x-request-id"),
+		Model:         model,
+		UpstreamModel: model,
+		Stream:        gjson.GetBytes(body, "stream").Bool(),
+	}, nil
 }
 
 func normalizeResponsesRequestServiceTier(req *apicompat.ResponsesRequest) {
